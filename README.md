@@ -35,7 +35,14 @@ The deployed app is ready to run without a secrets file because the key is enter
 
 Every prompt you send is placed on a schedule. Prompts are generated **one after another, in order**: as soon as the first image finishes, the next prompt starts automatically. You can keep typing and sending prompts while images are generating — they line up in the queue.
 
-- Live queue status is shown above the chat input and in the sidebar under **Scheduled prompts**.
+To schedule many prompts at once, use the **Schedule prompts** box in the sidebar:
+
+1. Write one prompt per line (as many as you want — 20, 50, more).
+2. Press **＋ Add to schedule**. Every line becomes one queued image.
+3. The worker generates them one by one, in order, without overlapping.
+
+- Live progress (current prompt + how many are waiting) is shown above the chat input and in the sidebar under **Scheduled prompts**.
+- Each scheduled image is saved to the conversation that was active when you added the prompt — switching conversations mid-queue does not move later images.
 - Remove a single prompt with the **×** button next to it, or empty the whole schedule with **Clear schedule**.
 
 ## Notes
