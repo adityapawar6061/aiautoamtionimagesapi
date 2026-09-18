@@ -33,17 +33,19 @@ The deployed app is ready to run without a secrets file because the key is enter
 
 ## Scheduled prompts (queue)
 
-Every prompt you send is placed on a schedule. Prompts are generated **one after another, in order**: as soon as the first image finishes, the next prompt starts automatically. You can keep typing and sending prompts while images are generating — they line up in the queue.
+Images are generated on a dedicated background thread, so prompts are always generated **strictly one after another, in order** — and nothing you do while an image is generating (adding more prompts, adding a schedule, switching conversations) can interrupt or restart it.
 
-To schedule many prompts at once, use the **Schedule prompts** box in the sidebar:
+**Schedule several at once:** press **＋ Add to schedule** in the sidebar, then:
 
-1. Write one prompt per line (as many as you want — 20, 50, more).
-2. Press **＋ Add to schedule**. Every line becomes one queued image.
-3. The worker generates them one by one, in order, without overlapping.
+1. Choose **how many images** you want to schedule.
+2. Fill in one prompt per field (that many fields appear).
+3. Press **＋ Add all to schedule** — they all join the queue and generate one by one.
 
-- Live progress (current prompt + how many are waiting) is shown above the chat input and in the sidebar under **Scheduled prompts**.
-- Each scheduled image is saved to the conversation that was active when you added the prompt — switching conversations mid-queue does not move later images.
-- Remove a single prompt with the **×** button next to it, or empty the whole schedule with **Clear schedule**.
+You can also queue a prompt any time from the normal chat input — it just joins the end of the queue.
+
+- Live progress (current prompt + waiting list) is shown above the chat input and in the sidebar.
+- Each image is saved to the conversation that was active when you scheduled it — switching conversations mid-queue does not move later images.
+- Remove a single waiting prompt with the **×** button next to it, or empty the queue with **Clear schedule**.
 
 ## Notes
 

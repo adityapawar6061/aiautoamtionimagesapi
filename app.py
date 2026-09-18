@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import base64
-import os
+import queue
 import sqlite3
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,91 +35,116 @@ def connect_db() -> sqlite3.Connection:
 
 
 def initialize_database() -> None:
-    with connect_db() as connection:
-        connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS conversations (
-                id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
+    connection = connect_db()
+    try:
+        with connection:
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-                role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
-                content TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS images (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-                message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
-                prompt TEXT NOT NULL,
-                file_path TEXT NOT NULL,
-                model TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            """
-        )
+                CREATE TABLE IF NOT EXISTS images (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                    message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+                    prompt TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
+    finally:
+        connection.close()
 
 
 def create_conversation(title: str = "New image session") -> str:
     conversation_id = str(uuid.uuid4())
     timestamp = now_iso()
-    with connect_db() as connection:
-        connection.execute(
-            "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
-            (conversation_id, title, timestamp, timestamp),
-        )
+    connection = connect_db()
+    try:
+        with connection:
+            connection.execute(
+                "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                (conversation_id, title, timestamp, timestamp),
+            )
+    finally:
+        connection.close()
     return conversation_id
 
 
 def list_conversations() -> list[sqlite3.Row]:
-    with connect_db() as connection:
+    connection = connect_db()
+    try:
         return connection.execute(
             "SELECT * FROM conversations ORDER BY updated_at DESC"
         ).fetchall()
+    finally:
+        connection.close()
 
 
 def get_messages(conversation_id: str) -> list[sqlite3.Row]:
-    with connect_db() as connection:
+    connection = connect_db()
+    try:
         return connection.execute(
             "SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at, id",
             (conversation_id,),
         ).fetchall()
+    finally:
+        connection.close()
 
 
 def add_message(conversation_id: str, role: str, content: str) -> int:
     timestamp = now_iso()
-    with connect_db() as connection:
-        cursor = connection.execute(
-            "INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-            (conversation_id, role, content, timestamp),
-        )
-        connection.execute(
-            "UPDATE conversations SET updated_at = ? WHERE id = ?",
-            (timestamp, conversation_id),
-        )
-        return int(cursor.lastrowid)
+    connection = connect_db()
+    try:
+        with connection:
+            cursor = connection.execute(
+                "INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+                (conversation_id, role, content, timestamp),
+            )
+            connection.execute(
+                "UPDATE conversations SET updated_at = ? WHERE id = ?",
+                (timestamp, conversation_id),
+            )
+            return int(cursor.lastrowid)
+    finally:
+        connection.close()
 
 
 def update_conversation_title(conversation_id: str, title: str) -> None:
-    with connect_db() as connection:
-        connection.execute(
-            "UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?",
-            (title[:60], now_iso(), conversation_id),
-        )
+    connection = connect_db()
+    try:
+        with connection:
+            connection.execute(
+                "UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?",
+                (title[:60], now_iso(), conversation_id),
+            )
+    finally:
+        connection.close()
 
 
 def count_conversation_images(conversation_id: str) -> int:
-    with connect_db() as connection:
+    connection = connect_db()
+    try:
         row = connection.execute(
             "SELECT COUNT(*) AS total FROM images WHERE conversation_id = ?",
             (conversation_id,),
         ).fetchone()
+    finally:
+        connection.close()
     return int(row["total"])
 
 
@@ -129,14 +155,18 @@ def add_image_record(
     file_path: str,
     model: str,
 ) -> None:
-    with connect_db() as connection:
-        connection.execute(
-            """
-            INSERT INTO images (conversation_id, message_id, prompt, file_path, model, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (conversation_id, message_id, prompt, file_path, model, now_iso()),
-        )
+    connection = connect_db()
+    try:
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO images (conversation_id, message_id, prompt, file_path, model, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (conversation_id, message_id, prompt, file_path, model, now_iso()),
+            )
+    finally:
+        connection.close()
 
 
 def load_conversation(conversation_id: str) -> None:
@@ -171,118 +201,175 @@ def generate_image(api_key: str, prompt: str, model: str, size: str) -> tuple[by
     return base64.b64decode(encoded), "png"
 
 
-def generate_and_save_image(job: dict[str, Any]) -> None:
-    """Generate one image for a scheduled job and persist everything.
+# ---------------------------------------------------------------------------
+# Background generation queue.
+#
+# Images are generated on a dedicated daemon thread that lives completely
+# outside Streamlit's rerun cycle. Nothing the user does in the UI — sending
+# new prompts, adding a schedule, switching conversations, clicking anything —
+# can interrupt or restart an image that is already being generated. The
+# thread pulls jobs from a FIFO queue, so prompts are always generated
+# strictly one after another, in the order they were scheduled.
+# ---------------------------------------------------------------------------
 
-    Called by the queue worker fragment, so the live progress (user prompt,
-    spinner, result) renders inside the fragment's output area. The image and
-    messages always go to the conversation the prompt was scheduled from,
-    even if the user has switched to another one meanwhile.
-    """
-    conversation_id = job["conversation_id"]
-    prompt = job["prompt"]
-    with st.chat_message("user"):
-        st.markdown(prompt)
 
-    with st.chat_message("assistant"):
-        with st.spinner("Creating your image..."):
+@st.cache_resource
+def worker() -> dict[str, Any]:
+    """Process-wide queue, worker thread and live state; survives reruns."""
+
+    resources: dict[str, Any] = {
+        "jobs": queue.Queue(),
+        "results": queue.Queue(),
+        "state": {"current": None},
+    }
+
+    def run_worker() -> None:
+        while True:
+            job: dict[str, Any] = resources["jobs"].get()
+            prompt = job["prompt"]
+            conversation_id = job["conversation_id"]
+            resources["state"]["current"] = prompt
+            user_message_id = add_message(conversation_id, "user", prompt)
             try:
-                image_bytes, extension = generate_image(
-                    st.session_state.api_key or "",
-                    prompt,
-                    st.session_state.image_model,
-                    st.session_state.image_size,
-                )
+                image_bytes, extension = generate_image(job["api_key"], prompt, job["model"], job["size"])
                 image_path = IMAGE_DIR / f"{conversation_id}-{uuid.uuid4().hex}.{extension}"
                 image_path.write_bytes(image_bytes)
                 response_text = "Created your image. It is saved with this conversation."
-                user_message_id = add_message(conversation_id, "user", prompt)
                 assistant_message_id = add_message(conversation_id, "assistant", response_text)
-                add_image_record(conversation_id, assistant_message_id, prompt, str(image_path), st.session_state.image_model)
-                if conversation_id == st.session_state.active_conversation_id:
-                    st.session_state.messages.append({"id": user_message_id, "role": "user", "content": prompt})
-                    st.session_state.messages.append(
-                        {"id": assistant_message_id, "role": "assistant", "content": response_text, "image_path": str(image_path)}
-                    )
-                # Title the conversation after its very first image.
+                add_image_record(conversation_id, assistant_message_id, prompt, str(image_path), job["model"])
                 if count_conversation_images(conversation_id) == 1:
                     update_conversation_title(conversation_id, prompt)
-                st.markdown(response_text)
-                st.image(str(image_path), width="stretch")
+                result = {
+                    "conversation_id": conversation_id,
+                    "user_message": {"id": user_message_id, "role": "user", "content": prompt},
+                    "assistant_message": {"id": assistant_message_id, "role": "assistant", "content": response_text, "image_path": str(image_path)},
+                }
             except Exception as error:
                 error_text = f"I could not create that image: {error}"
                 assistant_message_id = add_message(conversation_id, "assistant", error_text)
-                if conversation_id == st.session_state.active_conversation_id:
-                    st.session_state.messages.append({"id": assistant_message_id, "role": "assistant", "content": error_text})
-                st.error(error_text)
+                result = {
+                    "conversation_id": conversation_id,
+                    "user_message": {"id": user_message_id, "role": "user", "content": prompt},
+                    "assistant_message": {"id": assistant_message_id, "role": "assistant", "content": error_text},
+                }
+            resources["results"].put(result)
+            resources["state"]["current"] = None
+
+    thread = threading.Thread(target=run_worker, name="image-generation-worker", daemon=True)
+    thread.start()
+    resources["thread"] = thread
+    return resources
 
 
-@st.fragment(run_every="3s")
-def scheduled_prompt_worker() -> None:
-    """Background worker: creates scheduled images strictly one after another.
-
-    The fragment reruns on its own every few seconds, so the browser stays
-    responsive while an image generates. Each run claims at most one prompt
-    from the schedule, generates it to completion, then reruns the whole app,
-    which claims the next one. Prompts therefore never overlap and never run
-    in parallel — exactly one image is in progress at any moment.
-    """
-    queue = st.session_state.get("scheduled_prompts", [])
-    job = st.session_state.get("current_job")
-    if job is None and queue:
-        st.session_state.current_job = queue.pop(0)
-        st.session_state.scheduled_prompts = queue
-        job = st.session_state.current_job
-    if job is not None:
-        if job.get("attempted"):
-            # A previous run was interrupted mid-generation; skip the leftover
-            # job instead of generating it twice.
-            st.session_state.current_job = None
-        else:
-            job["attempted"] = True
-            generate_and_save_image(job)
-            st.session_state.current_job = None
-        st.rerun(scope="app")
-    render_queue_status()
+def enqueue_prompt(prompt: str) -> int:
+    """Put a prompt on the background queue; returns how many are now waiting."""
+    resources = worker()
+    resources["jobs"].put(
+        {
+            "id": uuid.uuid4().hex,
+            "prompt": prompt.strip(),
+            "conversation_id": st.session_state.active_conversation_id,
+            "api_key": (st.session_state.get("api_key") or "").strip(),
+            "model": st.session_state.image_model,
+            "size": st.session_state.image_size,
+        }
+    )
+    return resources["jobs"].qsize()
 
 
-def render_queue_status() -> None:
-    """Small live status line showing the current job and waiting prompts."""
-    queue = st.session_state.get("scheduled_prompts", [])
-    job = st.session_state.get("current_job")
+def list_waiting_jobs() -> list[dict[str, Any]]:
+    return list(worker()["jobs"].queue)
+
+
+def remove_waiting_job(job_id: str) -> None:
+    jobs = worker()["jobs"]
+    remaining = [job for job in list(jobs.queue) if job["id"] != job_id]
+    with jobs.mutex:
+        jobs.queue.clear()
+        jobs.queue.extend(remaining)
+
+
+def clear_waiting_jobs() -> None:
+    jobs = worker()["jobs"]
+    with jobs.mutex:
+        jobs.queue.clear()
+
+
+def render_generation_status() -> None:
+    """Small live status line: what is generating and what is waiting."""
+    resources = worker()
+    current = resources["state"].get("current")
+    waiting_jobs = list_waiting_jobs()
     lines: list[str] = []
-    if job:
-        preview = job["prompt"][:60] + ("..." if len(job["prompt"]) > 60 else "")
-        waiting = len(queue)
-        waiting_text = f" · {waiting} waiting" if waiting else ""
+    if current:
+        preview = current[:60] + ("..." if len(current) > 60 else "")
+        waiting_text = f" · {len(waiting_jobs)} waiting" if waiting_jobs else ""
         lines.append(f":orange[:material/progress_circle:] Generating image: {preview}{waiting_text}")
-    for index, item in enumerate(queue, start=1):
-        preview = item["prompt"][:60] + ("..." if len(item["prompt"]) > 60 else "")
+    for index, job in enumerate(waiting_jobs[:3], start=1):
+        preview = job["prompt"][:60] + ("..." if len(job["prompt"]) > 60 else "")
         lines.append(f":gray[**{index}.** {preview}]")
+    if len(waiting_jobs) > 3:
+        lines.append(f":gray[... and {len(waiting_jobs) - 3} more]")
     if lines:
         st.caption("  \n".join(lines))
 
 
-def add_scheduled_prompts() -> None:
-    """Sidebar ＋ button callback: queue every non-empty line as one prompt.
+@st.fragment(run_every="1s")
+def generation_mirror() -> None:
+    """UI mirror of the background worker.
 
-    Runs before widgets are instantiated on the rerun, so clearing the text
-    area's session key here is the supported way to reset the box.
+    A pure listener: it appends finished images to the open conversation and
+    shows live progress. It never touches the generation itself, so no UI
+    action can interrupt or restart an in-flight image.
     """
-    batch = st.session_state.get("schedule_batch_text", "")
-    prompts = [line.strip() for line in batch.splitlines() if line.strip()]
+    resources = worker()
+    changed = False
+    while True:
+        try:
+            result = resources["results"].get_nowait()
+        except queue.Empty:
+            break
+        if result["conversation_id"] == st.session_state.active_conversation_id:
+            st.session_state.messages.append(result["user_message"])
+            st.session_state.messages.append(result["assistant_message"])
+            changed = True
+    if changed:
+        st.rerun(scope="app")
+    render_generation_status()
+
+
+# ---------------------------------------------------------------------------
+# Schedule flow: ＋ button → "How many images?" → one field per prompt → all
+# of them join the queue and generate one after another.
+# ---------------------------------------------------------------------------
+
+
+def open_schedule_fields() -> None:
+    st.session_state.schedule_stage = "fields"
+    st.session_state.schedule_feedback = None
+
+
+def add_counted_prompts() -> None:
+    """＋ Add all button callback: queue every filled prompt field, in order."""
+    count = int(st.session_state.get("schedule_count") or 0)
+    prompts: list[str] = []
+    for index in range(1, count + 1):
+        value = (st.session_state.get(f"schedule_prompt_{index}") or "").strip()
+        if value:
+            prompts.append(value)
     if not (st.session_state.get("api_key") or "").strip():
         st.session_state.schedule_feedback = "Add your OpenAI API key in the sidebar first."
         return
     if not prompts:
-        st.session_state.schedule_feedback = "Type at least one prompt — one prompt per line."
+        st.session_state.schedule_feedback = "Fill in at least one prompt before adding to the schedule."
         return
-    conversation_id = st.session_state.active_conversation_id
-    st.session_state.scheduled_prompts = list(st.session_state.get("scheduled_prompts", [])) + [
-        {"id": uuid.uuid4().hex, "prompt": prompt, "conversation_id": conversation_id}
-        for prompt in prompts
-    ]
-    st.session_state.schedule_batch_text = ""
+    for prompt in prompts:
+        enqueue_prompt(prompt)
+    for index in range(1, count + 1):
+        key = f"schedule_prompt_{index}"
+        if key in st.session_state:
+            del st.session_state[key]
+    st.session_state.schedule_stage = "count"
     st.session_state.schedule_feedback = (
         f"Scheduled {len(prompts)} prompt{'s' if len(prompts) != 1 else ''} — "
         "they will generate one after another, in order."
@@ -339,34 +426,46 @@ def main() -> None:
 
         st.divider()
 
-        # Schedule panel: paste many prompts (one per line) and press ＋ to
-        # queue them all. The worker generates them one by one, in order.
+        # Schedule panel: ＋ → choose how many → one field per prompt → add all.
         st.markdown('<div class="history-label">Schedule prompts</div>', unsafe_allow_html=True)
-        st.text_area(
-            "Prompts to schedule",
-            height=120,
-            key="schedule_batch_text",
-            placeholder="One prompt per line, e.g.\nA neon koi pond at midnight\nA paper crane city above the clouds",
-            help="Write one prompt per line. Every line becomes one scheduled image, generated in order.",
-        )
-        st.button("＋ Add to schedule", type="primary", width="stretch", on_click=add_scheduled_prompts)
-        if "schedule_feedback" in st.session_state:
-            st.caption(f":gray[{st.session_state.schedule_feedback}]")
-            del st.session_state.schedule_feedback
+        if st.session_state.get("schedule_stage") == "fields":
+            st.number_input(
+                "How many images do you want to schedule?",
+                min_value=1,
+                max_value=50,
+                value=10,
+                step=1,
+                key="schedule_count",
+            )
+            count = int(st.session_state.schedule_count)
+            st.caption(f"One prompt per image — fill in your {count} prompt{'s' if count != 1 else ''}:")
+            for index in range(1, count + 1):
+                st.text_input(f"Prompt {index}", key=f"schedule_prompt_{index}", placeholder=f"Describe image {index}...")
+            add_col, cancel_col = st.columns([3, 1])
+            add_col.button("＋ Add all to schedule", type="primary", width="stretch", on_click=add_counted_prompts)
+            if cancel_col.button("✕", help="Back", width="stretch"):
+                st.session_state.schedule_stage = "count"
+        else:
+            st.caption("Schedule several images at once — they generate one after another.")
+            st.button("＋ Add to schedule", type="primary", width="stretch", on_click=open_schedule_fields)
 
-        queue = st.session_state.get("scheduled_prompts", [])
-        if queue:
-            st.caption(f"{len(queue)} prompt{'s' if len(queue) != 1 else ''} waiting — generated one by one, in order.")
-            for index, item in enumerate(queue):
+        if st.session_state.get("schedule_feedback"):
+            st.caption(f":gray[{st.session_state.schedule_feedback}]")
+            st.session_state.schedule_feedback = None
+
+        # Waiting prompts, with × to remove one or Clear schedule to empty all.
+        waiting_jobs = list_waiting_jobs()
+        if waiting_jobs:
+            st.caption(f"{len(waiting_jobs)} prompt{'s' if len(waiting_jobs) != 1 else ''} waiting — generated one by one, in order.")
+            for index, job in enumerate(waiting_jobs):
                 col_prompt, col_remove = st.columns([4, 1])
-                preview = item["prompt"][:34] + ("..." if len(item["prompt"]) > 34 else "")
+                preview = job["prompt"][:34] + ("..." if len(job["prompt"]) > 34 else "")
                 col_prompt.markdown(f"**{index + 1}.** {preview}")
-                if col_remove.button(":material/close:", key=f"remove-scheduled-{item['id']}", help="Remove this prompt from the schedule"):
-                    queue.pop(index)
-                    st.session_state.scheduled_prompts = queue
+                if col_remove.button(":material/close:", key=f"remove-scheduled-{job['id']}", help="Remove this prompt from the schedule"):
+                    remove_waiting_job(job["id"])
                     st.rerun()
             if st.button("Clear schedule", width="stretch"):
-                st.session_state.scheduled_prompts = []
+                clear_waiting_jobs()
                 st.rerun()
         else:
             st.caption("Nothing scheduled yet.")
@@ -377,29 +476,24 @@ def main() -> None:
     with col2:
         st.selectbox("Image size", ["1024x1024", "1536x1024", "1024x1536"], key="image_size")
         st.selectbox("Image model", ["gpt-image-1"], key="image_model")
-        st.caption("Every prompt creates one image, saved to the conversation that was active when you scheduled it.")
+        st.caption("Scheduled images are saved to the conversation that was active when you scheduled them.")
 
     with col1:
         for message in st.session_state.messages:
             render_message(message)
         if not st.session_state.messages:
-            st.markdown('<div class="hint">Describe an image below, or schedule many prompts from the sidebar. Try: “A glass greenhouse on Mars at blue hour, editorial photography.”</div>', unsafe_allow_html=True)
+            st.markdown('<div class="hint">Describe an image below, or press ＋ Add to schedule in the sidebar. Try: “A glass greenhouse on Mars at blue hour, editorial photography.”</div>', unsafe_allow_html=True)
 
-        # Live queue status + one-by-one worker (refreshes itself).
-        scheduled_prompt_worker()
+        # Live status + mirror of the background worker (refreshes itself).
+        generation_mirror()
 
         prompt = st.chat_input("Describe the image you want to create...")
         if prompt:
             if not api_key:
                 st.error("Add your OpenAI API key in the sidebar before creating an image.")
                 st.stop()
-
-            # Every prompt goes onto the schedule; the worker generates them
-            # one at a time, so the next image starts as soon as the first one
-            # finishes — even if you keep typing more prompts.
-            queue = st.session_state.get("scheduled_prompts", [])
-            queue.append({"id": uuid.uuid4().hex, "prompt": prompt, "conversation_id": st.session_state.active_conversation_id})
-            st.session_state.scheduled_prompts = queue
+            position = enqueue_prompt(prompt)
+            st.toast(f"Added to the schedule — {position} prompt{'s' if position != 1 else ''} waiting.", icon="🗓️")
             st.rerun()
 
 
