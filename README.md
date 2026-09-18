@@ -31,6 +31,13 @@ The API key is held only in the current Streamlit session. Conversation data is 
 
 The deployed app is ready to run without a secrets file because the key is entered in the UI. Streamlit Community Cloud has ephemeral local storage, so SQLite history and generated images are not guaranteed to survive app restarts or redeployments. Use a hosted database and object storage for permanent production history.
 
+## Scheduled prompts (queue)
+
+Every prompt you send is placed on a schedule. Prompts are generated **one after another, in order**: as soon as the first image finishes, the next prompt starts automatically. You can keep typing and sending prompts while images are generating — they line up in the queue.
+
+- Live queue status is shown above the chat input and in the sidebar under **Scheduled prompts**.
+- Remove a single prompt with the **×** button next to it, or empty the whole schedule with **Clear schedule**.
+
 ## Notes
 
 - Image generation uses `gpt-image-1` by default.

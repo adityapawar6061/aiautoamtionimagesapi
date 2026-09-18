@@ -142,6 +142,14 @@ def ensure_active_conversation() -> None:
         load_conversation(conversation_id)
 
 
+def render_message(message: dict[str, Any]) -> None:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+        image_path = message.get("image_path")
+        if image_path and Path(image_path).exists():
+            st.image(image_path, width="stretch")
+
+
 def generate_image(api_key: str, prompt: str, model: str, size: str) -> tuple[bytes, str]:
     if OpenAI is None:
         raise RuntimeError("The OpenAI package is not installed. Run: pip install -r requirements.txt")
@@ -154,11 +162,75 @@ def generate_image(api_key: str, prompt: str, model: str, size: str) -> tuple[by
     return base64.b64decode(encoded), "png"
 
 
-def render_message(message: dict[str, Any]) -> None:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        if message.get("image_path") and Path(message["image_path"]).exists():
-            st.image(message["image_path"], use_container_width=True)
+def generate_and_save_image(prompt: str, api_key: str) -> None:
+    """Generate an image for the prompt, persist it, and append both chat messages.
+
+    Used by both the direct chat-input path and the scheduled queue worker.
+    """
+    conversation_id = st.session_state.active_conversation_id
+    user_message_id = add_message(conversation_id, "user", prompt)
+    user_message = {"id": user_message_id, "role": "user", "content": prompt}
+    st.session_state.messages.append(user_message)
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        with st.spinner("Creating your image..."):
+            try:
+                image_bytes, extension = generate_image(
+                    api_key, prompt, st.session_state.image_model, st.session_state.image_size
+                )
+                image_path = IMAGE_DIR / f"{conversation_id}-{uuid.uuid4().hex}.{extension}"
+                image_path.write_bytes(image_bytes)
+                response_text = "Created your image. It is saved with this conversation."
+                assistant_message_id = add_message(conversation_id, "assistant", response_text)
+                add_image_record(conversation_id, assistant_message_id, prompt, str(image_path), st.session_state.image_model)
+                assistant_message = {"id": assistant_message_id, "role": "assistant", "content": response_text, "image_path": str(image_path)}
+                st.session_state.messages.append(assistant_message)
+                # Title the conversation after its very first image.
+                if sum(1 for message in st.session_state.messages if message["role"] == "assistant" and "image_path" in message) == 1:
+                    update_conversation_title(conversation_id, prompt)
+                st.markdown(response_text)
+                st.image(str(image_path), width="stretch")
+            except Exception as error:
+                error_text = f"I could not create that image: {error}"
+                assistant_message_id = add_message(conversation_id, "assistant", error_text)
+                st.session_state.messages.append({"id": assistant_message_id, "role": "assistant", "content": error_text})
+                st.error(error_text)
+
+
+@st.fragment(run_every="2s")
+def scheduled_prompt_worker() -> None:
+    """Background worker: creates queued images one after another.
+
+    Reruns every 2 seconds on its own, so the chat input stays usable while
+    the queue drains. When the queue is empty it does nothing.
+    """
+    queue = st.session_state.get("scheduled_prompts", [])
+    if queue:
+        item = queue.pop(0)
+        st.session_state.scheduled_prompts = queue
+        st.session_state.queue_running = True
+        generate_and_save_image(item["prompt"], st.session_state.api_key or "")
+        st.rerun(scope="app")
+    elif st.session_state.get("queue_running"):
+        st.session_state.queue_running = False
+        st.rerun(scope="app")
+    render_queue_status()
+
+
+def render_queue_status() -> None:
+    """Small live status line showing the queue and current activity."""
+    queue = st.session_state.get("scheduled_prompts", [])
+    running = st.session_state.get("queue_running", False)
+    lines: list[str] = []
+    if running:
+        lines.append(":orange[:material/progress_circle:] Generating image, the next prompt starts automatically when it finishes...")
+    for index, item in enumerate(queue, start=1):
+        preview = item["prompt"][:60] + ("..." if len(item["prompt"]) > 60 else "")
+        lines.append(f":gray[**{index}.** {preview}]")
+    if lines:
+        st.caption("  \n".join(lines))
 
 
 def main() -> None:
@@ -197,7 +269,7 @@ def main() -> None:
         api_key = st.text_input("OpenAI API key", type="password", value=st.session_state.get("api_key", ""), help="Used only for this browser session; it is not written to the database.")
         st.session_state.api_key = api_key
         st.divider()
-        if st.button("+ New conversation", use_container_width=True):
+        if st.button("+ New conversation"):
             conversation_id = create_conversation()
             load_conversation(conversation_id)
             st.rerun()
@@ -205,11 +277,31 @@ def main() -> None:
         st.markdown('<div class="history-label">History</div>', unsafe_allow_html=True)
         for conversation in list_conversations():
             label = conversation["title"] or "Untitled session"
-            if st.button(label, key=f"conversation-{conversation['id']}", use_container_width=True):
+            if st.button(label, key=f"conversation-{conversation['id']}"):
                 load_conversation(conversation["id"])
                 st.rerun()
 
         st.divider()
+
+        # Scheduled prompts (queue): every prompt added here is generated one
+        # after another, in order, starting as soon as the previous image is done.
+        st.markdown('<div class="history-label">Scheduled prompts</div>', unsafe_allow_html=True)
+        queue = st.session_state.get("scheduled_prompts", [])
+        if queue:
+            for index, item in enumerate(queue):
+                col_prompt, col_remove = st.columns([4, 1])
+                preview = item["prompt"][:34] + ("..." if len(item["prompt"]) > 34 else "")
+                col_prompt.markdown(f"**{index + 1}.** {preview}")
+                if col_remove.button(":material/close:", key=f"remove-scheduled-{item['id']}", help="Remove this prompt from the schedule"):
+                    queue.pop(index)
+                    st.session_state.scheduled_prompts = queue
+                    st.rerun()
+            if st.button("Clear schedule"):
+                st.session_state.scheduled_prompts = []
+                st.rerun()
+        else:
+            st.caption("Nothing scheduled yet.")
+
         st.caption("Your key stays in session memory. Conversations and generated images stay in this app folder.")
 
     col1, col2 = st.columns([3, 1])
@@ -224,37 +316,22 @@ def main() -> None:
         if not st.session_state.messages:
             st.markdown('<div class="hint">Describe an image below. Try: “A glass greenhouse on Mars at blue hour, editorial photography.”</div>', unsafe_allow_html=True)
 
+        # Live queue status (refreshes itself while the schedule drains).
+        scheduled_prompt_worker()
+
         prompt = st.chat_input("Describe the image you want to create...")
         if prompt:
             if not api_key:
                 st.error("Add your OpenAI API key in the sidebar before creating an image.")
                 st.stop()
 
-            user_message_id = add_message(st.session_state.active_conversation_id, "user", prompt)
-            user_message = {"id": user_message_id, "role": "user", "content": prompt}
-            st.session_state.messages.append(user_message)
-            render_message(user_message)
-
-            with st.chat_message("assistant"):
-                with st.spinner("Creating your image..."):
-                    try:
-                        image_bytes, extension = generate_image(api_key, prompt, st.session_state.image_model, st.session_state.image_size)
-                        image_path = IMAGE_DIR / f"{st.session_state.active_conversation_id}-{uuid.uuid4().hex}.{extension}"
-                        image_path.write_bytes(image_bytes)
-                        response_text = "Created your image. It is saved with this conversation."
-                        assistant_message_id = add_message(st.session_state.active_conversation_id, "assistant", response_text)
-                        add_image_record(st.session_state.active_conversation_id, assistant_message_id, prompt, str(image_path), st.session_state.image_model)
-                        assistant_message = {"id": assistant_message_id, "role": "assistant", "content": response_text, "image_path": str(image_path)}
-                        st.session_state.messages.append(assistant_message)
-                        if len(st.session_state.messages) == 2:
-                            update_conversation_title(st.session_state.active_conversation_id, prompt)
-                        st.markdown(response_text)
-                        st.image(str(image_path), use_container_width=True)
-                    except Exception as error:
-                        error_text = f"I could not create that image: {error}"
-                        assistant_message_id = add_message(st.session_state.active_conversation_id, "assistant", error_text)
-                        st.session_state.messages.append({"id": assistant_message_id, "role": "assistant", "content": error_text})
-                        st.error(error_text)
+            # Every prompt goes onto the schedule; the worker generates them
+            # one at a time, so the next image starts as soon as the first one
+            # finishes — even if you keep typing more prompts.
+            queue = st.session_state.get("scheduled_prompts", [])
+            queue.append({"id": uuid.uuid4().hex, "prompt": prompt})
+            st.session_state.scheduled_prompts = queue
+            st.rerun(scope="app")
 
 
 if __name__ == "__main__":
